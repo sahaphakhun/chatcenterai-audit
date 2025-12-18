@@ -18,6 +18,12 @@ const socketIo = require("socket.io");
 const InstructionDataService = require("./services/instructionDataService");
 const createNotificationService = require("./services/notificationService");
 const slipOkService = require("./services/slipOkService");
+const {
+  validateOrderDraft,
+  buildAuditAskMessage,
+  buildAuditSummaryMessage,
+} = require("./services/orderAuditService");
+const { extractOrderDraftFromChat } = require("./services/orderDraftExtractor");
 // Middleware & misc packages for UI
 const helmet = require("helmet");
 const cors = require("cors");
@@ -1299,6 +1305,7 @@ async function saveChatHistory(
     userMessageDoc._id = userInsertResult.insertedId;
   }
   await appendOrderExtractionMessage(userMessageDoc);
+  triggerOrderAuditRunner(userMessageDoc);
 
   try {
     if (typeof io !== "undefined" && io) {
@@ -3191,6 +3198,53 @@ const ORDER_EXTRACTION_MODES = Object.freeze({
   REALTIME: "realtime",
 });
 
+const ORDER_AUDIT_DEFAULT_WAIT_SECONDS = 60;
+
+const ORDER_AUDIT_SESSIONS_COLLECTION = "order_audit_sessions";
+const ORDER_AUDIT_SESSION_TTL_DAYS = 14;
+const ORDER_AUDIT_WORKER_INTERVAL_MS = 10 * 1000;
+
+let orderAuditTimer = null;
+let orderAuditProcessing = false;
+
+function getDefaultOrderAuditConfig() {
+  return {
+    enabled: false,
+    waitForMainAiSeconds: ORDER_AUDIT_DEFAULT_WAIT_SECONDS,
+  };
+}
+
+function normalizeOrderAuditConfig(rawConfig) {
+  const defaults = getDefaultOrderAuditConfig();
+  if (!rawConfig || typeof rawConfig !== "object") return defaults;
+
+  const normalizeInt = (value, fallback, options = {}) => {
+    const { min = 0, max = 86400 } = options || {};
+    const parsed = sanitizeOptionalNumber(value);
+    if (typeof parsed !== "number" || !Number.isFinite(parsed)) {
+      return fallback;
+    }
+    const rounded = Math.round(parsed);
+    if (Number.isNaN(rounded)) return fallback;
+    if (rounded < min) return min;
+    if (rounded > max) return max;
+    return rounded;
+  };
+
+  const normalized = { ...defaults };
+
+  const enabled = parseOptionalBoolean(rawConfig.enabled);
+  if (enabled !== undefined) normalized.enabled = enabled;
+
+  normalized.waitForMainAiSeconds = normalizeInt(
+    rawConfig.waitForMainAiSeconds,
+    defaults.waitForMainAiSeconds,
+    { min: 0, max: 3600 },
+  );
+
+  return normalized;
+}
+
 function normalizeAiConfig(raw = {}) {
   const allowedModes = ["responses", "chat"];
   const parseNum = (val) => {
@@ -3364,6 +3418,21 @@ async function ensureOrderBufferIndexes() {
   }
 }
 
+async function ensureOrderAuditSessionIndexes() {
+  try {
+    const client = await connectDB();
+    const db = client.db("chatbot");
+    const coll = db.collection(ORDER_AUDIT_SESSIONS_COLLECTION);
+
+    await coll.createIndex({ pageKey: 1, userId: 1 }, { unique: true });
+    await coll.createIndex({ platform: 1, botId: 1, userId: 1 });
+    await coll.createIndex({ "pending.dueAt": 1 });
+    await coll.createIndex({ expireAt: 1 }, { expireAfterSeconds: 0 });
+  } catch (error) {
+    console.error("[OrderAudit] ไม่สามารถสร้างดัชนีได้:", error.message);
+  }
+}
+
 async function ensureOrderCutoffSetting(platform, botId = null) {
   const normalizedPlatform = normalizeOrderPlatform(platform);
   const normalizedBotId = normalizeOrderBotId(botId);
@@ -3488,6 +3557,7 @@ async function listOrderCutoffPages() {
       orderModel: pageSettings.orderModel || "gpt-4.1-nano",
       orderExtractionEnabled: pageSettings.orderExtractionEnabled !== false,
       orderPromptInstructions: pageSettings.orderPromptInstructions || "",
+      orderAudit: normalizeOrderAuditConfig(pageSettings.orderAudit),
     });
   });
 
@@ -3519,6 +3589,7 @@ async function listOrderCutoffPages() {
       orderModel: pageSettings.orderModel || "gpt-4.1-nano",
       orderExtractionEnabled: pageSettings.orderExtractionEnabled !== false,
       orderPromptInstructions: pageSettings.orderPromptInstructions || "",
+      orderAudit: normalizeOrderAuditConfig(pageSettings.orderAudit),
     });
   });
 
@@ -3535,6 +3606,573 @@ async function listOrderCutoffPages() {
   }
 
   return pages;
+}
+
+// ============================ Order Audit (AI sidecar) ============================
+
+function isOrderAuditMessageDoc(messageDoc) {
+  if (!messageDoc || typeof messageDoc !== "object") return false;
+  const source =
+    typeof messageDoc.source === "string" ? messageDoc.source.trim() : "";
+  const metadata =
+    typeof messageDoc.metadata === "string" ? messageDoc.metadata.trim() : "";
+  return source === "order_audit" || metadata === "order_audit";
+}
+
+function shouldTriggerOrderAuditForMessageDoc(messageDoc) {
+  if (!messageDoc || typeof messageDoc !== "object") return false;
+  if (isOrderAuditMessageDoc(messageDoc)) return false;
+  const role =
+    typeof messageDoc.role === "string" ? messageDoc.role.trim() : "";
+  if (role === "user") return true;
+  const source =
+    typeof messageDoc.source === "string" ? messageDoc.source.trim() : "";
+  return ["admin_chat", "admin_page"].includes(source);
+}
+
+function triggerOrderAuditRunner(messageDoc) {
+  if (!shouldTriggerOrderAuditForMessageDoc(messageDoc)) return;
+  try {
+    setImmediate(() => {
+      runOrderAuditForNewMessage(messageDoc).catch((error) => {
+        console.error("[OrderAudit] Runner error:", error.message || error);
+      });
+    });
+  } catch (error) {
+    console.error("[OrderAudit] ไม่สามารถ trigger runner ได้:", error.message);
+  }
+}
+
+async function getOrderAuditConfigForContext(platform, botId = null) {
+  const normalizedPlatform = normalizeOrderPlatform(platform);
+  const normalizedBotId = normalizeOrderBotId(botId);
+
+  try {
+    const client = await connectDB();
+    const db = client.db("chatbot");
+    const pageSettings = await db.collection("follow_up_page_settings").findOne({
+      platform: normalizedPlatform || "line",
+      botId: normalizedBotId || null,
+    });
+
+    const orderAudit = normalizeOrderAuditConfig(pageSettings?.orderAudit);
+    const fallbackModel =
+      pageSettings?.orderModel ||
+      (await getSettingValue("orderModel", "gpt-4.1-nano"));
+    const model = fallbackModel;
+
+    return { orderAudit, model, pageSettings: pageSettings || null };
+  } catch (error) {
+    console.warn("[OrderAudit] โหลด page settings ไม่สำเร็จ:", error.message);
+    const orderAudit = normalizeOrderAuditConfig(null);
+    const model = "gpt-4.1-nano";
+    return { orderAudit, model, pageSettings: null };
+  }
+}
+
+async function fetchChatHistoryForOrderAudit(
+  userId,
+  platform = "line",
+  botId = null,
+  limit = 60,
+) {
+  const normalizedPlatform = normalizeOrderPlatform(platform);
+  const normalizedBotId = normalizeOrderBotId(botId);
+
+  const client = await connectDB();
+  const db = client.db("chatbot");
+  const coll = db.collection("chat_history");
+
+  const query = {
+    senderId: userId,
+    botId: normalizedBotId || null,
+  };
+
+  if (normalizedPlatform === "line") {
+    query.$or = [
+      { platform: "line" },
+      { platform: null },
+      { platform: { $exists: false } },
+    ];
+  } else {
+    query.platform = normalizedPlatform;
+  }
+
+  const docs = await coll
+    .find(query)
+    .sort({ timestamp: -1 })
+    .limit(limit)
+    .toArray();
+
+  docs.reverse();
+  return docs;
+}
+
+async function isMainAiEnabledForOrderAudit(userId, platform, botId = null) {
+  const systemAiEnabled = await getSettingValue("aiEnabled", true);
+  if (!systemAiEnabled) return false;
+
+  try {
+    const status = await getUserStatus(userId);
+    if (!status || status.aiEnabled === false) {
+      return false;
+    }
+  } catch (_) {
+    return false;
+  }
+
+  const normalizedPlatform = normalizeOrderPlatform(platform);
+  const normalizedBotId = normalizeOrderBotId(botId);
+  if (!normalizedBotId) return true;
+
+  try {
+    const client = await connectDB();
+    const db = client.db("chatbot");
+
+    if (normalizedPlatform === "facebook" && ObjectId.isValid(normalizedBotId)) {
+      const bot = await db.collection("facebook_bots").findOne(
+        { _id: new ObjectId(normalizedBotId) },
+        { projection: { status: 1 } },
+      );
+      if (bot && bot.status && bot.status !== "active") return false;
+    }
+
+    if (normalizedPlatform === "line" && ObjectId.isValid(normalizedBotId)) {
+      const bot = await db.collection("line_bots").findOne(
+        { _id: new ObjectId(normalizedBotId) },
+        { projection: { status: 1 } },
+      );
+      if (bot && bot.status && bot.status !== "active") return false;
+    }
+  } catch (_) {
+    // If bot lookup fails, default to "enabled" to avoid sending before AI.
+    return true;
+  }
+
+  return true;
+}
+
+async function deliverOrderAuditMessage(params = {}) {
+  const { userId, platform, botId, messageText } = params || {};
+
+  const trimmed = typeof messageText === "string" ? messageText.trim() : "";
+  if (!trimmed) return null;
+
+  const normalizedPlatform = normalizeOrderPlatform(platform);
+  const normalizedBotId = normalizeOrderBotId(botId);
+
+  const client = await connectDB();
+  const db = client.db("chatbot");
+
+  if (normalizedPlatform === "facebook") {
+    if (!normalizedBotId) {
+      throw new Error("ไม่พบ Facebook Bot สำหรับการส่งข้อความ");
+    }
+    const query = ObjectId.isValid(normalizedBotId)
+      ? { _id: new ObjectId(normalizedBotId) }
+      : { _id: normalizedBotId };
+    const fbBot = await db.collection("facebook_bots").findOne(query);
+    if (!fbBot || !fbBot.accessToken) {
+      throw new Error("ไม่พบข้อมูล Facebook Bot");
+    }
+    await sendFacebookMessage(userId, trimmed, fbBot.accessToken, {
+      metadata: "order_audit",
+    });
+  } else {
+    const lineClientFromContext = await getLineClientForContext(normalizedBotId);
+    if (!lineClientFromContext) {
+      throw new Error("Line Client ยังไม่ถูกตั้งค่า");
+    }
+    await lineClientFromContext.pushMessage(userId, { type: "text", text: trimmed });
+  }
+
+  const historyColl = db.collection("chat_history");
+  const timestamp = new Date();
+  const messageDoc = {
+    senderId: userId,
+    role: "assistant",
+    content: trimmed,
+    timestamp,
+    platform: normalizedPlatform,
+    botId: normalizedBotId || null,
+    source: "order_audit",
+    metadata: "order_audit",
+  };
+
+  const insertResult = await historyColl.insertOne(messageDoc);
+  if (insertResult?.insertedId) {
+    messageDoc._id = insertResult.insertedId;
+  }
+
+  try {
+    if (io) {
+      io.emit("newMessage", {
+        userId,
+        message: messageDoc,
+        sender: "assistant",
+        timestamp,
+      });
+    }
+  } catch (_) { }
+
+  return messageDoc;
+}
+
+async function runOrderAuditForNewMessage(triggerMessageDoc) {
+  if (!OPENAI_API_KEY) return;
+  if (!shouldTriggerOrderAuditForMessageDoc(triggerMessageDoc)) return;
+
+  const userId = triggerMessageDoc.senderId;
+  const platform = triggerMessageDoc.platform || "line";
+  const botId = triggerMessageDoc.botId || null;
+  const normalizedPlatform = normalizeOrderPlatform(platform);
+  const normalizedBotId = normalizeOrderBotId(botId);
+  const pageKey = buildOrderPageKey(normalizedPlatform, normalizedBotId);
+
+  const { orderAudit, model } = await getOrderAuditConfigForContext(
+    normalizedPlatform,
+    normalizedBotId,
+  );
+  if (!orderAudit || orderAudit.enabled !== true) {
+    return;
+  }
+
+  const now = new Date();
+  const expireAt = new Date(
+    now.getTime() + ORDER_AUDIT_SESSION_TTL_DAYS * 24 * 60 * 60 * 1000,
+  );
+
+  const client = await connectDB();
+  const db = client.db("chatbot");
+  const sessionsColl = db.collection(ORDER_AUDIT_SESSIONS_COLLECTION);
+
+  const existingSession = await sessionsColl.findOne({ pageKey, userId });
+  const session = existingSession || {};
+  const isCustomerTrigger =
+    triggerMessageDoc?.role === "user" || triggerMessageDoc?.source === "user";
+
+  const historyDocs = await fetchChatHistoryForOrderAudit(
+    userId,
+    normalizedPlatform,
+    normalizedBotId,
+    80,
+  );
+
+  const filteredHistory = historyDocs.filter((doc) => !isOrderAuditMessageDoc(doc));
+  const normalizedMessages = filteredHistory
+    .map((doc) => {
+      const normalized = normalizeMessageForFrontend(doc);
+      const content =
+        typeof normalized.content === "string" ? normalized.content.trim() : "";
+      if (!content) return null;
+      return {
+        role: normalized.role === "user" ? "user" : "assistant",
+        content,
+      };
+    })
+    .filter(Boolean);
+
+  const extraction = await extractOrderDraftFromChat({
+    apiKey: OPENAI_API_KEY,
+    model,
+    messages: normalizedMessages,
+  });
+
+  const extractedDraft = extraction?.draft || null;
+  const extractedItems =
+    extractedDraft && Array.isArray(extractedDraft.items) ? extractedDraft.items : [];
+
+  if (!extraction || extraction.hasDraft !== true || extractedItems.length === 0) {
+    const updateDoc = {
+      $set: {
+        pageKey,
+        userId,
+        platform: normalizedPlatform,
+        botId: normalizedBotId || null,
+        lastProcessedAt: now,
+        lastProcessedMessageId: triggerMessageDoc?._id?.toString?.() || null,
+        updatedAt: now,
+        expireAt,
+      },
+      $setOnInsert: { createdAt: now },
+    };
+
+    if (isCustomerTrigger) {
+      updateDoc.$set.status = "collecting";
+      updateDoc.$set.draft = null;
+      updateDoc.$set.missingFields = [];
+      updateDoc.$set.lastAskedFields = [];
+      updateDoc.$unset = { pending: "" };
+    }
+
+    await sessionsColl.updateOne({ pageKey, userId }, updateDoc, { upsert: true });
+    return;
+  }
+
+  const validation = validateOrderDraft(extractedDraft);
+  const missingKeys = Array.isArray(validation.missingFields)
+    ? validation.missingFields.map((entry) => entry.field).filter(Boolean)
+    : [];
+
+  const kind = validation.isComplete ? "summary" : "ask_missing";
+  const messageText = validation.isComplete
+    ? buildAuditSummaryMessage(validation.normalizedDraft)
+    : buildAuditAskMessage(validation.missingFields);
+
+  if (!messageText) {
+    const updateDoc = {
+      $set: {
+        pageKey,
+        userId,
+        platform: normalizedPlatform,
+        botId: normalizedBotId || null,
+        draft: validation.normalizedDraft || extractedDraft,
+        missingFields: missingKeys,
+        lastProcessedAt: now,
+        lastProcessedMessageId: triggerMessageDoc?._id?.toString?.() || null,
+        updatedAt: now,
+        expireAt,
+      },
+      $setOnInsert: { createdAt: now },
+    };
+
+    if (isCustomerTrigger) {
+      updateDoc.$set.status = "collecting";
+      updateDoc.$unset = { pending: "" };
+    }
+
+    await sessionsColl.updateOne({ pageKey, userId }, updateDoc, { upsert: true });
+    return;
+  }
+
+  const mainAiEnabled = await isMainAiEnabledForOrderAudit(
+    userId,
+    normalizedPlatform,
+    normalizedBotId,
+  );
+  const waitSeconds = mainAiEnabled ? orderAudit.waitForMainAiSeconds : 0;
+
+  const baseUpdate = {
+    pageKey,
+    userId,
+    platform: normalizedPlatform,
+    botId: normalizedBotId || null,
+    status: validation.isComplete ? "complete" : "collecting",
+    draft: validation.normalizedDraft,
+    missingFields: validation.isComplete ? [] : missingKeys,
+    lastAskedFields: validation.isComplete ? [] : missingKeys,
+    lastProcessedAt: now,
+    lastProcessedMessageId: triggerMessageDoc?._id?.toString?.() || null,
+    updatedAt: now,
+    expireAt,
+  };
+
+  if (waitSeconds && waitSeconds > 0) {
+    const existingPending = session.pending && session.pending.dueAt
+      ? session.pending
+      : null;
+    const shouldPreservePendingWindow =
+      existingPending &&
+      triggerMessageDoc?.role !== "user" &&
+      new Date(existingPending.dueAt).getTime() > now.getTime();
+
+    const dueAt = shouldPreservePendingWindow
+      ? new Date(existingPending.dueAt)
+      : new Date(now.getTime() + waitSeconds * 1000);
+    const triggeredAt = shouldPreservePendingWindow
+      ? new Date(existingPending.triggeredAt)
+      : triggerMessageDoc?.timestamp
+        ? new Date(triggerMessageDoc.timestamp)
+        : now;
+    const triggerMessageId = shouldPreservePendingWindow
+      ? existingPending.triggerMessageId || null
+      : triggerMessageDoc?._id?.toString?.() || null;
+
+    await sessionsColl.updateOne(
+      { pageKey, userId },
+      {
+        $set: {
+          ...baseUpdate,
+          pending: {
+            kind,
+            messageText,
+            dueAt,
+            triggeredAt,
+            triggerMessageId,
+          },
+        },
+        $setOnInsert: { createdAt: now },
+      },
+      { upsert: true },
+    );
+    return;
+  }
+
+  try {
+    await deliverOrderAuditMessage({
+      userId,
+      platform: normalizedPlatform,
+      botId: normalizedBotId,
+      messageText,
+    });
+
+    await sessionsColl.updateOne(
+      { pageKey, userId },
+      {
+        $set: {
+          ...baseUpdate,
+          lastPushedAt: now,
+        },
+        $unset: { pending: "" },
+        $setOnInsert: { createdAt: now },
+      },
+      { upsert: true },
+    );
+  } catch (sendError) {
+    console.error("[OrderAudit] ส่งข้อความไม่สำเร็จ:", sendError.message);
+    await sessionsColl.updateOne(
+      { pageKey, userId },
+      {
+        $set: {
+          ...baseUpdate,
+          updatedAt: now,
+          expireAt,
+        },
+        $unset: { pending: "" },
+        $setOnInsert: { createdAt: now },
+      },
+      { upsert: true },
+    );
+  }
+}
+
+async function processDueOrderAuditSessions() {
+  if (orderAuditProcessing) return;
+  orderAuditProcessing = true;
+
+  try {
+    const now = new Date();
+    const client = await connectDB();
+    const db = client.db("chatbot");
+    const sessionsColl = db.collection(ORDER_AUDIT_SESSIONS_COLLECTION);
+    const chatColl = db.collection("chat_history");
+
+    const dueSessions = await sessionsColl
+      .find({ "pending.dueAt": { $lte: now } })
+      .sort({ "pending.dueAt": 1 })
+      .limit(25)
+      .toArray();
+
+    for (const session of dueSessions) {
+      if (!session || !session.pending || !session.pending.messageText) {
+        continue;
+      }
+
+      const userId = session.userId;
+      const platform = session.platform || "line";
+      const botId = session.botId || null;
+      const pageKey = session.pageKey;
+
+      const { orderAudit } = await getOrderAuditConfigForContext(platform, botId);
+      if (!orderAudit || orderAudit.enabled !== true) {
+        await sessionsColl.updateOne(
+          { _id: session._id },
+          { $unset: { pending: "" }, $set: { updatedAt: now } },
+        );
+        continue;
+      }
+
+      const pendingTriggeredAt = session.pending.triggeredAt
+        ? new Date(session.pending.triggeredAt)
+        : null;
+
+      if (pendingTriggeredAt) {
+        const platformQuery =
+          (session.platform || platform) === "line"
+            ? {
+                $or: [
+                  { platform: "line" },
+                  { platform: null },
+                  { platform: { $exists: false } },
+                ],
+              }
+            : { platform: session.platform || platform };
+
+        const newerUserMessage = await chatColl.findOne(
+          {
+            senderId: userId,
+            role: "user",
+            botId: botId || null,
+            timestamp: { $gt: pendingTriggeredAt },
+            ...platformQuery,
+          },
+          { sort: { timestamp: -1 } },
+        );
+
+        if (newerUserMessage) {
+          await sessionsColl.updateOne(
+            { _id: session._id },
+            { $unset: { pending: "" }, $set: { updatedAt: now } },
+          );
+          continue;
+        }
+      }
+
+      const kind = session.pending.kind;
+      const messageText = session.pending.messageText;
+
+      try {
+        await deliverOrderAuditMessage({
+          userId,
+          platform,
+          botId,
+          messageText,
+        });
+
+        await sessionsColl.updateOne(
+          { _id: session._id },
+          {
+            $set: {
+              status: kind === "summary" ? "complete" : "collecting",
+              lastPushedAt: now,
+              updatedAt: now,
+              expireAt: new Date(
+                now.getTime() + ORDER_AUDIT_SESSION_TTL_DAYS * 24 * 60 * 60 * 1000,
+              ),
+            },
+            $unset: { pending: "" },
+          },
+        );
+      } catch (error) {
+        console.error(
+          `[OrderAudit] ส่ง pending ไม่สำเร็จ (${pageKey}/${userId}):`,
+          error.message,
+        );
+        await sessionsColl.updateOne(
+          { _id: session._id },
+          { $unset: { pending: "" }, $set: { updatedAt: now } },
+        );
+      }
+    }
+  } finally {
+    orderAuditProcessing = false;
+  }
+}
+
+function startOrderAuditWorker() {
+  if (orderAuditTimer) return;
+  const runner = async () => {
+    try {
+      await processDueOrderAuditSessions();
+    } catch (error) {
+      console.error("[OrderAudit] Worker ล้มเหลว:", error.message);
+    }
+  };
+  orderAuditTimer = setInterval(runner, ORDER_AUDIT_WORKER_INTERVAL_MS);
+  console.log(
+    `[OrderAudit] Worker เริ่มทำงาน (interval ${ORDER_AUDIT_WORKER_INTERVAL_MS / 1000}s)`,
+  );
+  runner();
 }
 
 async function orderBufferMessagesForUser(pageKey, userId) {
@@ -8175,9 +8813,24 @@ server.listen(PORT, async () => {
   }
 
   try {
+    await ensureOrderAuditSessionIndexes();
+  } catch (orderAuditIndexError) {
+    console.error(
+      `[ERROR] ensureOrderAuditSessionIndexes ล้มเหลว:`,
+      orderAuditIndexError,
+    );
+  }
+
+  try {
     startFollowUpTaskWorker();
   } catch (followUpWorkerError) {
     console.error(`[ERROR] startFollowUpTaskWorker ล้มเหลว:`, followUpWorkerError);
+  }
+
+  try {
+    startOrderAuditWorker();
+  } catch (orderAuditWorkerError) {
+    console.error(`[ERROR] startOrderAuditWorker ล้มเหลว:`, orderAuditWorkerError);
   }
 
   try {
@@ -10772,7 +11425,7 @@ app.post("/webhook/facebook/:botId", async (req, res) => {
                 const isBroadcastMessage = metadata === "broadcast_auto";
 
                 // ข้ามข้อความที่ระบบส่งอัตโนมัติ (เช่น AI / follow-up) เพื่อหลีกเลี่ยงการบันทึกซ้ำ
-                const automatedMetadata = ["ai_generated", "follow_up_auto"];
+                const automatedMetadata = ["ai_generated", "follow_up_auto", "order_audit"];
                 if (metadata && automatedMetadata.includes(metadata)) {
                   console.log(
                     `[Facebook Bot: ${facebookBot.name}] Skip echo for automated message (${metadata}) to ${targetUserId}`,
@@ -10890,6 +11543,7 @@ app.post("/webhook/facebook/:botId", async (req, res) => {
                   }
                   if (!isBroadcastMessage) {
                     await appendOrderExtractionMessage(baseDoc);
+                    triggerOrderAuditRunner(baseDoc);
                     maybeAnalyzeOrder(
                       targetUserId,
                       "facebook",
@@ -17618,6 +18272,64 @@ app.post("/admin/orders/pages/ai-settings", async (req, res) => {
   }
 });
 
+// Save Order Audit per page
+app.post("/admin/orders/pages/audit-settings", async (req, res) => {
+  try {
+    const { pageKey, platform, botId, orderAudit } = req.body || {};
+
+    let targetPlatform = platform ? normalizeOrderPlatform(platform) : null;
+    let targetBotId = typeof botId === "string" ? botId : null;
+
+    if (pageKey && pageKey !== "all") {
+      const parsed = parseOrderPageKey(pageKey);
+      targetPlatform = parsed.platform || targetPlatform;
+      targetBotId = parsed.botId === null ? null : parsed.botId || targetBotId;
+    }
+
+    if (!targetPlatform) {
+      return res.json({
+        success: false,
+        error: "ไม่พบเพจที่ต้องการตั้งค่า",
+      });
+    }
+
+    const normalizedBotId =
+      targetBotId === "default" ? null : normalizeOrderBotId(targetBotId);
+
+    const normalizedAudit = normalizeOrderAuditConfig(orderAudit);
+
+    const client = await connectDB();
+    const db = client.db("chatbot");
+    const coll = db.collection("follow_up_page_settings");
+
+    const filter = {
+      platform: targetPlatform,
+      botId: normalizedBotId || null,
+    };
+
+    await coll.updateOne(
+      filter,
+      {
+        $set: {
+          orderAudit: normalizedAudit,
+          updatedAt: new Date(),
+        },
+        $setOnInsert: {
+          platform: targetPlatform,
+          botId: normalizedBotId || null,
+          createdAt: new Date(),
+        },
+      },
+      { upsert: true },
+    );
+
+    res.json({ success: true, orderAudit: normalizedAudit });
+  } catch (error) {
+    console.error("[Orders] ไม่สามารถบันทึกการตั้งค่า Order Audit ได้:", error);
+    res.json({ success: false, error: error.message });
+  }
+});
+
 
 // Get users who have chatted
 app.get("/admin/chat/users", async (req, res) => {
@@ -18013,6 +18725,7 @@ app.post("/admin/chat/send", async (req, res) => {
       messageDoc._id = messageInsertResult.insertedId;
     }
     await appendOrderExtractionMessage(messageDoc);
+    triggerOrderAuditRunner(messageDoc);
     await resetUserUnreadCount(userId);
 
     try {

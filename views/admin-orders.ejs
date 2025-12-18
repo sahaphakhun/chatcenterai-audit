@@ -273,6 +273,29 @@
                       หากต้องการปรับแต่งการสกัดออเดอร์สำหรับเพจนี้</small>
                   </div>
 
+                  <hr>
+
+                  <!-- Order Audit Settings -->
+                  <h6 class="mb-3"><i class="fas fa-shield me-2"></i>Order Audit (สรุปออเดอร์/ถามข้อมูลขาด)</h6>
+
+                  <div class="form-check form-switch mb-3">
+                    <input class="form-check-input" type="checkbox" id="auditSettingsEnabled">
+                    <label class="form-check-label fw-semibold" for="auditSettingsEnabled">
+                      เปิดใช้งาน Order Audit สำหรับเพจนี้
+                    </label>
+                    <div class="text-muted small">ส่งข้อความเฉพาะเมื่อ “ตรวจพบ order draft/มีรายการสินค้า”</div>
+                  </div>
+
+                  <div class="mb-3">
+                    <label class="form-label fw-semibold">รอ AI หลักก่อนส่ง (วินาที)</label>
+                    <input type="number" class="form-control" id="auditSettingsWaitSeconds" min="0" max="3600" step="1">
+                    <small class="text-muted">ใช้เมื่อระบบ AI หลักเปิด (เช่น 60 วินาที)</small>
+                  </div>
+
+                  <div class="text-muted small mb-3">
+                    ตรวจข้อมูลขั้นต่ำ: ชื่อผู้รับ, ที่อยู่, ตำบล/แขวง, อำเภอ/เขต, รหัสไปรษณีย์ 5 หลัก, เบอร์โทร 10 หลัก
+                  </div>
+
                   <!-- Save Button -->
                   <button type="button" class="btn btn-primary w-100" id="aiSettingsSaveBtn">
                     <i class="fas fa-save me-1"></i> บันทึกการตั้งค่า
@@ -401,11 +424,16 @@
         document.getElementById('aiSettingsEnabled').checked = page.orderExtractionEnabled !== false;
         document.getElementById('aiSettingsModel').value = page.orderModel || 'gpt-4.1-nano';
         document.getElementById('aiSettingsPrompt').value = page.orderPromptInstructions || '';
+
+        const audit = page.orderAudit || {};
+        document.getElementById('auditSettingsEnabled').checked = audit.enabled === true;
+        document.getElementById('auditSettingsWaitSeconds').value =
+          typeof audit.waitForMainAiSeconds === 'number' ? audit.waitForMainAiSeconds : 60;
       }
 
-	      async function savePageAISettings() {
-	        const page = aiSettingsPages.find(p => p.pageKey === selectedPageKey);
-	        if (!page) return;
+		      async function savePageAISettings() {
+		        const page = aiSettingsPages.find(p => p.pageKey === selectedPageKey);
+		        if (!page) return;
 	
 	        const showInlineError = (message) => {
 	          const msg = message || 'เกิดข้อผิดพลาด';
@@ -421,6 +449,16 @@
         const enabled = document.getElementById('aiSettingsEnabled').checked;
         const orderModel = document.getElementById('aiSettingsModel').value;
         const prompt = document.getElementById('aiSettingsPrompt').value.trim();
+
+        const auditEnabled = document.getElementById('auditSettingsEnabled').checked;
+        const auditWaitSecondsRaw = parseInt(document.getElementById('auditSettingsWaitSeconds').value, 10);
+
+        const safeInt = (value, fallback) => Number.isFinite(value) ? value : fallback;
+
+        const orderAudit = {
+          enabled: auditEnabled,
+          waitForMainAiSeconds: safeInt(auditWaitSecondsRaw, 60)
+        };
 
         const btn = document.getElementById('aiSettingsSaveBtn');
         btn.disabled = true;
@@ -441,25 +479,41 @@
           });
           const data = await res.json();
 
-	          if (data.success) {
-	            btn.innerHTML = '<i class="fas fa-check me-1"></i> บันทึกแล้ว';
-            // Update local data
-            page.orderExtractionEnabled = enabled;
-            page.orderModel = orderModel;
-            page.orderPromptInstructions = prompt;
-            setTimeout(() => {
-              btn.innerHTML = '<i class="fas fa-save me-1"></i> บันทึกการตั้งค่า';
-            }, 2000);
-	          } else {
-	            showInlineError(data.error || 'เกิดข้อผิดพลาด');
-	            btn.innerHTML = '<i class="fas fa-save me-1"></i> บันทึกการตั้งค่า';
-	          }
-	        } catch (e) {
-	          showInlineError('เกิดข้อผิดพลาดในการบันทึก');
-	          btn.innerHTML = '<i class="fas fa-save me-1"></i> บันทึกการตั้งค่า';
-	        }
-	        btn.disabled = false;
-	      }
+          if (!data.success) {
+            throw new Error(data.error || 'ไม่สามารถบันทึกการตั้งค่า AI ได้');
+          }
+
+          const auditRes = await fetch('/admin/orders/pages/audit-settings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              pageKey: page.pageKey,
+              platform: page.platform,
+              botId: page.botId,
+              orderAudit
+            })
+          });
+          const auditData = await auditRes.json();
+
+          if (!auditData.success) {
+            throw new Error(auditData.error || 'ไม่สามารถบันทึกการตั้งค่า Order Audit ได้');
+          }
+
+          btn.innerHTML = '<i class="fas fa-check me-1"></i> บันทึกแล้ว';
+          // Update local data
+          page.orderExtractionEnabled = enabled;
+          page.orderModel = orderModel;
+          page.orderPromptInstructions = prompt;
+          page.orderAudit = auditData.orderAudit || orderAudit;
+          setTimeout(() => {
+            btn.innerHTML = '<i class="fas fa-save me-1"></i> บันทึกการตั้งค่า';
+          }, 2000);
+		        } catch (e) {
+		          showInlineError(e?.message || 'เกิดข้อผิดพลาดในการบันทึก');
+		          btn.innerHTML = '<i class="fas fa-save me-1"></i> บันทึกการตั้งค่า';
+		        }
+		        btn.disabled = false;
+		      }
 
       // Page select change event
       document.getElementById('aiSettingsPageSelect')?.addEventListener('change', function () {
