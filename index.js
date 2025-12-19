@@ -1665,6 +1665,10 @@ const DEFAULT_ORDER_PROMPT_BODY = `วิเคราะห์บทสนทน
 - weight: น้ำหนัก (กิโลกรัม)
 - หากได้รับข้อมูลที่อยู่หรือชื่อลูกค้าจากออเดอร์ก่อนหน้า ให้ใช้เป็นค่าเริ่มต้นเมื่อไม่มีข้อมูลใหม่`;
 
+const ORDER_TRACKING_FOLLOWUP_RULE = `กติกาเพิ่มเติม (สำคัญ):
+- ถ้าลูกค้าถามเรื่อง "ติดตามออเดอร์/สถานะจัดส่ง/เลขพัสดุ/เลข tracking/ของถึงหรือยัง/ส่งไปถึงไหน/เช็คสถานะพัสดุ" และไม่ได้ยืนยันสั่งซื้อเพิ่ม → ให้ถือว่าเป็นการติดตามออเดอร์เดิม ไม่ใช่ออเดอร์ใหม่
+- ในกรณีนี้ให้ตอบ hasOrder=false และ orderData=null (แม้จะมีข้อมูลสินค้า/ที่อยู่จากบริบทก่อนหน้า)`;
+
 const ORDER_PROMPT_JSON_SUFFIX = `ตอบเป็น JSON เท่านั้น: {
   "hasOrder": true/false,
   "orderData": {
@@ -4218,7 +4222,68 @@ async function listOrderBufferUsersWithActivity(pageKey, since) {
   }));
 }
 
-function findDuplicateOrder(existingOrders, newOrderData) {
+const ORDER_DUPLICATE_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+function normalizeOrderComparisonText(value) {
+  if (typeof value !== "string") {
+    if (value === null || typeof value === "undefined") return "";
+    return normalizeOrderComparisonText(String(value));
+  }
+
+  const trimmed = value.normalize("NFKC").trim().toLowerCase();
+  if (!trimmed) return "";
+  return trimmed.replace(/[^\p{L}\p{N}]+/gu, "");
+}
+
+function buildOrderItemsSignature(items) {
+  if (!Array.isArray(items) || items.length === 0) {
+    return "";
+  }
+
+  const normalized = [];
+
+  items.forEach((item) => {
+    if (!item || typeof item !== "object") return;
+    const product = normalizeOrderComparisonText(item.product || item.name || "");
+    if (!product) return;
+    const quantityNumber = Number(item.quantity);
+    const quantity = Number.isFinite(quantityNumber) ? quantityNumber : 0;
+    const priceNumber = Number(item.price);
+    const price = Number.isFinite(priceNumber) ? priceNumber : 0;
+    normalized.push(`${product}|${quantity}|${price}`);
+  });
+
+  if (!normalized.length) {
+    return "";
+  }
+
+  normalized.sort((a, b) => a.localeCompare(b));
+  return normalized.join(",");
+}
+
+function buildOrderAddressSignature(orderData = {}) {
+  const parts = normalizeOrderAddress(orderData || {});
+  const keyParts = [
+    parts.fullAddress,
+    parts.subDistrict,
+    parts.district,
+    parts.province,
+    parts.postalCode,
+  ]
+    .map(normalizeOrderComparisonText)
+    .filter(Boolean);
+
+  return keyParts.join("|");
+}
+
+function normalizeOrderComparisonDate(value) {
+  if (!value) return null;
+  const asDate = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(asDate.getTime())) return null;
+  return asDate;
+}
+
+function findDuplicateOrder(existingOrders, newOrderData, options = {}) {
   if (!Array.isArray(existingOrders) || !newOrderData) {
     return null;
   }
@@ -4228,22 +4293,48 @@ function findDuplicateOrder(existingOrders, newOrderData) {
     return null;
   }
 
+  const referenceTime =
+    options.referenceTime instanceof Date &&
+    !Number.isNaN(options.referenceTime.getTime())
+      ? options.referenceTime
+      : new Date();
+
+  const windowMs =
+    typeof options.windowMs === "number" && Number.isFinite(options.windowMs)
+      ? Math.max(0, options.windowMs)
+      : ORDER_DUPLICATE_WINDOW_MS;
+
+  const newItemsSignature = buildOrderItemsSignature(newItems);
+  const newAddressSignature = buildOrderAddressSignature(newOrderData);
+  if (!newItemsSignature || !newAddressSignature) {
+    return null;
+  }
+
   return (
     existingOrders.find((order) => {
+      const extractedAt = normalizeOrderComparisonDate(order?.extractedAt);
+      if (!extractedAt) return false;
+      if (
+        windowMs > 0 &&
+        Math.abs(referenceTime.getTime() - extractedAt.getTime()) > windowMs
+      ) {
+        return false;
+      }
+
       const existingItems = Array.isArray(order.orderData?.items)
         ? order.orderData.items
         : [];
-      if (existingItems.length !== newItems.length) return false;
+      const existingItemsSignature = buildOrderItemsSignature(existingItems);
+      if (!existingItemsSignature || existingItemsSignature !== newItemsSignature) {
+        return false;
+      }
 
-      return existingItems.every((existingItem, index) => {
-        const newItem = newItems[index];
-        if (!newItem) return false;
-        return (
-          existingItem.product === newItem.product &&
-          Number(existingItem.quantity) === Number(newItem.quantity) &&
-          Number(existingItem.price) === Number(newItem.price)
-        );
-      });
+      const existingAddressSignature = buildOrderAddressSignature(order.orderData || {});
+      if (!existingAddressSignature || existingAddressSignature !== newAddressSignature) {
+        return false;
+      }
+
+      return true;
     }) || null
   );
 }
@@ -4302,6 +4393,63 @@ async function markMessagesAsOrderExtracted(
   } catch (error) {
     console.error(
       "[Order] ไม่สามารถมาร์กข้อความที่สกัดแล้วได้:",
+      error.message,
+    );
+  }
+}
+
+async function markAllUnprocessedMessagesAsOrderExtracted(
+  userId,
+  extractionRoundId,
+  orderId = null,
+  options = {},
+) {
+  if (!userId || !extractionRoundId) {
+    return;
+  }
+
+  const { markUntil = null } = options || {};
+  const markUntilDate =
+    markUntil instanceof Date && !Number.isNaN(markUntil.getTime())
+      ? markUntil
+      : null;
+
+  try {
+    const client = await connectDB();
+    const db = client.db("chatbot");
+    const coll = db.collection("chat_history");
+
+    const updateDoc = {
+      orderExtractionRoundId: extractionRoundId,
+      orderExtractionMarkedAt: new Date(),
+    };
+
+    if (orderId) {
+      try {
+        updateDoc.orderId =
+          typeof orderId === "string" ? new ObjectId(orderId) : orderId;
+      } catch (error) {
+        updateDoc.orderId = orderId;
+      }
+    }
+
+    const query = {
+      senderId: userId,
+      $or: [
+        { orderExtractionRoundId: { $exists: false } },
+        { orderExtractionRoundId: null },
+        { orderExtractionRoundId: "" },
+      ],
+    };
+
+    if (markUntilDate) {
+      query.timestamp = { $lte: markUntilDate };
+    }
+
+    await coll.updateMany(query, { $set: updateDoc });
+  } catch (error) {
+    console.error(
+      "[Order] ไม่สามารถมาร์กข้อความค้างที่สกัดแล้วได้:",
       error.message,
     );
   }
@@ -4484,7 +4632,7 @@ async function analyzeOrderFromChat(userId, messages, options = {}) {
   } else {
     promptBody = (await getOrderPromptBody(platform, botId)).trim();
   }
-  const systemPrompt = `${promptBody}\n\n${ORDER_PROMPT_JSON_SUFFIX}`;
+  const systemPrompt = `${promptBody}\n\n${ORDER_TRACKING_FOLLOWUP_RULE}\n\n${ORDER_PROMPT_JSON_SUFFIX}`;
 
   // ดึงรายการสินค้าที่เคยสกัดไว้ในระบบ เพื่อให้ AI ใช้ชื่อเดียวกัน
   const existingProducts = await getExistingProductNames({ platform, botId, limit: 30 });
@@ -4866,13 +5014,8 @@ async function maybeAnalyzeOrder(
       return;
     }
 
+    const markUntil = unprocessedMessages[unprocessedMessages.length - 1]?.timestamp;
     const targetMessages = unprocessedMessages.slice(-20);
-    const messageIds = targetMessages
-      .map((msg) => msg.messageId)
-      .filter(Boolean);
-    if (!messageIds.length) {
-      return;
-    }
 
     const existingOrders = await getUserOrders(userId);
     const latestOrder = existingOrders?.[0];
@@ -4891,16 +5034,17 @@ async function maybeAnalyzeOrder(
     const duplicateOrder = findDuplicateOrder(
       existingOrders,
       analysis.orderData,
+      { referenceTime: markUntil },
     );
 
     if (duplicateOrder) {
       console.log(`[Order] พบออเดอร์ซ้ำสำหรับผู้ใช้ ${userId}`);
       const extractionRoundId = new ObjectId().toString();
-      await markMessagesAsOrderExtracted(
+      await markAllUnprocessedMessagesAsOrderExtracted(
         userId,
-        messageIds,
         extractionRoundId,
         duplicateOrder?._id?.toString?.() || null,
+        { markUntil },
       );
       await maybeAnalyzeFollowUp(userId, platform, botId, {
         reasonOverride: analysis.reason,
@@ -4933,11 +5077,11 @@ async function maybeAnalyzeOrder(
     }
 
     const extractionRoundId = new ObjectId().toString();
-    await markMessagesAsOrderExtracted(
+    await markAllUnprocessedMessagesAsOrderExtracted(
       userId,
-      messageIds,
       extractionRoundId,
       orderId?.toString?.() || orderId,
+      { markUntil },
     );
 
     await maybeAnalyzeFollowUp(userId, platform, botId, {
@@ -5048,6 +5192,9 @@ async function processOrderCutoffForPage(pageConfig, options = {}) {
         continue;
       }
 
+      const referenceTime =
+        normalizedMessages[normalizedMessages.length - 1]?.timestamp || new Date();
+
       const targetMessages = normalizedMessages.slice(-50).map((msg) => ({
         role: msg.role,
         content:
@@ -5073,6 +5220,7 @@ async function processOrderCutoffForPage(pageConfig, options = {}) {
       const duplicateOrder = findDuplicateOrder(
         existingOrders,
         analysis.orderData,
+        { referenceTime },
       );
 
       const extractionRoundId = new ObjectId().toString();
@@ -18972,18 +19120,9 @@ app.post("/admin/chat/orders/extract", async (req, res) => {
       });
     }
 
+    const markUntil =
+      unprocessedMessages[unprocessedMessages.length - 1]?.timestamp || null;
     const targetMessages = unprocessedMessages.slice(-50);
-    const messageIds = targetMessages
-      .map((msg) => msg.messageId)
-      .filter(Boolean);
-
-    if (!messageIds.length) {
-      return res.json({
-        success: true,
-        hasOrder: false,
-        reason: "ไม่พบข้อความใหม่ที่สามารถสกัดได้",
-      });
-    }
 
     const existingOrders = await getUserOrders(userId);
     const latestOrder = existingOrders?.[0];
@@ -19020,15 +19159,20 @@ app.post("/admin/chat/orders/extract", async (req, res) => {
     const duplicateOrder = findDuplicateOrder(
       existingOrders,
       analysis.orderData,
+      { referenceTime: lastMessage?.timestamp || markUntil },
     );
     if (duplicateOrder) {
       const extractionRoundId = new ObjectId().toString();
-      await markMessagesAsOrderExtracted(
+      await markAllUnprocessedMessagesAsOrderExtracted(
         userId,
-        messageIds,
         extractionRoundId,
         duplicateOrder?._id?.toString?.() || null,
+        { markUntil },
       );
+      try {
+        const pageKey = buildOrderPageKey(platform, botId);
+        await clearOrderBufferForUser(pageKey, userId);
+      } catch (_) { }
 
       return res.json({
         success: true,
@@ -19052,11 +19196,11 @@ app.post("/admin/chat/orders/extract", async (req, res) => {
     }
 
     const extractionRoundId = new ObjectId().toString();
-    await markMessagesAsOrderExtracted(
+    await markAllUnprocessedMessagesAsOrderExtracted(
       userId,
-      messageIds,
       extractionRoundId,
       orderId?.toString?.() || orderId,
+      { markUntil },
     );
 
     await maybeAnalyzeFollowUp(userId, platform, botId, {
@@ -19064,6 +19208,11 @@ app.post("/admin/chat/orders/extract", async (req, res) => {
       followUpUpdatedAt: new Date(),
       forceUpdate: true,
     });
+
+    try {
+      const pageKey = buildOrderPageKey(platform, botId);
+      await clearOrderBufferForUser(pageKey, userId);
+    } catch (_) { }
 
     try {
       if (io) {
