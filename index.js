@@ -20,6 +20,7 @@ const createNotificationService = require("./services/notificationService");
 const slipOkService = require("./services/slipOkService");
 const {
   DEFAULT_AUDIT_ASK_TEMPLATE,
+  DEFAULT_AUDIT_ASK_FIELD_TEMPLATES,
   DEFAULT_AUDIT_SUMMARY_TEMPLATE,
   validateOrderDraft,
   buildAuditAskMessage,
@@ -3218,6 +3219,7 @@ function getDefaultOrderAuditConfig() {
     enabled: false,
     waitForMainAiSeconds: ORDER_AUDIT_DEFAULT_WAIT_SECONDS,
     askMissingTemplate: DEFAULT_AUDIT_ASK_TEMPLATE,
+    askMissingFieldTemplates: { ...DEFAULT_AUDIT_ASK_FIELD_TEMPLATES },
     summaryTemplate: DEFAULT_AUDIT_SUMMARY_TEMPLATE,
   };
 }
@@ -3260,6 +3262,23 @@ function normalizeOrderAuditConfig(rawConfig) {
     rawConfig.askMissingTemplate,
     defaults.askMissingTemplate,
   );
+  const rawFieldTemplates =
+    rawConfig.askMissingFieldTemplates &&
+    typeof rawConfig.askMissingFieldTemplates === "object"
+      ? rawConfig.askMissingFieldTemplates
+      : {};
+  const normalizedFieldTemplates = {};
+  Object.keys(DEFAULT_AUDIT_ASK_FIELD_TEMPLATES).forEach((key) => {
+    const rawValue = rawFieldTemplates[key];
+    if (typeof rawValue === "string") {
+      const trimmed = rawValue.trim();
+      normalizedFieldTemplates[key] =
+        trimmed || DEFAULT_AUDIT_ASK_FIELD_TEMPLATES[key];
+      return;
+    }
+    normalizedFieldTemplates[key] = DEFAULT_AUDIT_ASK_FIELD_TEMPLATES[key];
+  });
+  normalized.askMissingFieldTemplates = normalizedFieldTemplates;
   normalized.summaryTemplate = normalizeTemplate(
     rawConfig.summaryTemplate,
     defaults.summaryTemplate,
@@ -3946,7 +3965,10 @@ async function runOrderAuditForNewMessage(triggerMessageDoc) {
       )
     : buildAuditAskMessage(
         validation.missingFields,
-        auditTemplates.askMissingTemplate,
+        {
+          template: auditTemplates.askMissingTemplate,
+          fieldTemplates: auditTemplates.askMissingFieldTemplates,
+        },
       );
 
   if (!messageText) {

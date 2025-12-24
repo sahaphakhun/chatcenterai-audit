@@ -301,6 +301,46 @@
                   </div>
 
                   <div class="mb-3">
+                    <label class="form-label fw-semibold">ข้อความแยกตามข้อมูลที่ขาด</label>
+                    <div class="text-muted small mb-2">
+                      ระบบจะนำข้อความของฟิลด์ที่ขาดมาแทน <code>{{missing_fields}}</code> (ปล่อยว่างเพื่อใช้ค่าเริ่มต้น)
+                    </div>
+                    <div class="row g-2">
+                      <div class="col-12 col-md-6">
+                        <label class="form-label small">ชื่อผู้รับ</label>
+                        <input type="text" class="form-control" id="auditMissingCustomerName">
+                      </div>
+                      <div class="col-12 col-md-6">
+                        <label class="form-label small">ที่อยู่</label>
+                        <input type="text" class="form-control" id="auditMissingShippingAddress">
+                      </div>
+                      <div class="col-12 col-md-6">
+                        <label class="form-label small">ตำบล/แขวง</label>
+                        <input type="text" class="form-control" id="auditMissingAddressSubDistrict">
+                      </div>
+                      <div class="col-12 col-md-6">
+                        <label class="form-label small">อำเภอ/เขต</label>
+                        <input type="text" class="form-control" id="auditMissingAddressDistrict">
+                      </div>
+                      <div class="col-12 col-md-6">
+                        <label class="form-label small">จังหวัด</label>
+                        <input type="text" class="form-control" id="auditMissingAddressProvince">
+                      </div>
+                      <div class="col-12 col-md-6">
+                        <label class="form-label small">รหัสไปรษณีย์</label>
+                        <input type="text" class="form-control" id="auditMissingAddressPostalCode">
+                      </div>
+                      <div class="col-12 col-md-6">
+                        <label class="form-label small">เบอร์โทร</label>
+                        <input type="text" class="form-control" id="auditMissingPhone">
+                      </div>
+                    </div>
+                    <small class="text-muted">
+                      ตัวแปรที่ใช้ได้: <code>{{field_label}}</code>, <code>{{field_key}}</code>
+                    </small>
+                  </div>
+
+                  <div class="mb-3">
                     <label class="form-label fw-semibold">ข้อความสรุปยอด/สรุปออเดอร์</label>
                     <textarea class="form-control" id="auditSettingsSummaryTemplate" rows="8"></textarea>
                     <small class="text-muted">
@@ -449,6 +489,14 @@
           typeof audit.waitForMainAiSeconds === 'number' ? audit.waitForMainAiSeconds : 60;
         document.getElementById('auditSettingsAskTemplate').value = audit.askMissingTemplate || '';
         document.getElementById('auditSettingsSummaryTemplate').value = audit.summaryTemplate || '';
+        const fieldTemplates = audit.askMissingFieldTemplates || {};
+        document.getElementById('auditMissingCustomerName').value = fieldTemplates.customerName || '';
+        document.getElementById('auditMissingShippingAddress').value = fieldTemplates.shippingAddress || '';
+        document.getElementById('auditMissingAddressSubDistrict').value = fieldTemplates.addressSubDistrict || '';
+        document.getElementById('auditMissingAddressDistrict').value = fieldTemplates.addressDistrict || '';
+        document.getElementById('auditMissingAddressProvince').value = fieldTemplates.addressProvince || '';
+        document.getElementById('auditMissingAddressPostalCode').value = fieldTemplates.addressPostalCode || '';
+        document.getElementById('auditMissingPhone').value = fieldTemplates.phone || '';
       }
 
 		      async function savePageAISettings() {
@@ -474,6 +522,15 @@
         const auditWaitSecondsRaw = parseInt(document.getElementById('auditSettingsWaitSeconds').value, 10);
         const auditAskTemplate = document.getElementById('auditSettingsAskTemplate').value;
         const auditSummaryTemplate = document.getElementById('auditSettingsSummaryTemplate').value;
+        const auditFieldTemplates = {
+          customerName: document.getElementById('auditMissingCustomerName').value,
+          shippingAddress: document.getElementById('auditMissingShippingAddress').value,
+          addressSubDistrict: document.getElementById('auditMissingAddressSubDistrict').value,
+          addressDistrict: document.getElementById('auditMissingAddressDistrict').value,
+          addressProvince: document.getElementById('auditMissingAddressProvince').value,
+          addressPostalCode: document.getElementById('auditMissingAddressPostalCode').value,
+          phone: document.getElementById('auditMissingPhone').value
+        };
 
         const safeInt = (value, fallback) => Number.isFinite(value) ? value : fallback;
 
@@ -481,6 +538,7 @@
           enabled: auditEnabled,
           waitForMainAiSeconds: safeInt(auditWaitSecondsRaw, 60),
           askMissingTemplate: auditAskTemplate,
+          askMissingFieldTemplates: auditFieldTemplates,
           summaryTemplate: auditSummaryTemplate
         };
 

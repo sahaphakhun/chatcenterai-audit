@@ -82,6 +82,16 @@ const FIELD_LABELS = Object.freeze({
   phone: "เบอร์โทร (10 หลัก)",
 });
 
+const DEFAULT_AUDIT_ASK_FIELD_TEMPLATES = Object.freeze({
+  customerName: "- ชื่อผู้รับ",
+  shippingAddress: "- ที่อยู่",
+  addressSubDistrict: "- ตำบล",
+  addressDistrict: "- อำเภอ",
+  addressProvince: "- จังหวัด",
+  addressPostalCode: "- รหัสไปรษณีย์ (5 หลัก)",
+  phone: "- เบอร์โทร (10 หลัก)",
+});
+
 function normalizeTemplateString(value, fallback) {
   if (typeof value !== "string") return fallback;
   const trimmed = value.trim();
@@ -189,22 +199,57 @@ function formatOrderItemsLines(items) {
 
 function buildAuditAskMessage(
   missingFields = [],
-  template = DEFAULT_AUDIT_ASK_TEMPLATE,
+  options = DEFAULT_AUDIT_ASK_TEMPLATE,
 ) {
   if (!Array.isArray(missingFields) || missingFields.length === 0) {
     return "";
   }
 
-  const labels = missingFields
-    .map((entry) => (entry && entry.label ? String(entry.label).trim() : ""))
+  const normalizedOptions =
+    typeof options === "string"
+      ? { template: options }
+      : options && typeof options === "object"
+        ? options
+        : {};
+
+  const fieldTemplates =
+    normalizedOptions.fieldTemplates &&
+    typeof normalizedOptions.fieldTemplates === "object"
+      ? normalizedOptions.fieldTemplates
+      : {};
+
+  const labels = [];
+  const lines = missingFields
+    .map((entry) => {
+      if (!entry || typeof entry !== "object") return "";
+      const fieldKey = typeof entry.field === "string" ? entry.field.trim() : "";
+      const label = entry.label
+        ? String(entry.label).trim()
+        : FIELD_LABELS[fieldKey] || "";
+      if (label) labels.push(label);
+
+      const customTemplateRaw =
+        fieldKey && typeof fieldTemplates[fieldKey] === "string"
+          ? fieldTemplates[fieldKey].trim()
+          : "";
+      const fallbackLine =
+        DEFAULT_AUDIT_ASK_FIELD_TEMPLATES[fieldKey] || (label ? `- ${label}` : "");
+      const lineTemplate = customTemplateRaw || fallbackLine;
+      if (!lineTemplate) return "";
+
+      return renderTemplate(lineTemplate, {
+        field_label: label,
+        field_key: fieldKey,
+      }).trim();
+    })
     .filter(Boolean);
 
-  if (!labels.length) return "";
+  if (!lines.length) return "";
 
-  const missingLines = labels.map((label) => `- ${label}`).join("\n");
-  const missingText = labels.join(", ");
+  const missingLines = lines.join("\n");
+  const missingText = labels.filter(Boolean).join(", ");
   const safeTemplate = normalizeTemplateString(
-    template,
+    normalizedOptions.template,
     DEFAULT_AUDIT_ASK_TEMPLATE,
   );
 
@@ -284,6 +329,7 @@ function buildAuditSummaryMessage(
 
 module.exports = {
   DEFAULT_AUDIT_ASK_TEMPLATE,
+  DEFAULT_AUDIT_ASK_FIELD_TEMPLATES,
   DEFAULT_AUDIT_SUMMARY_TEMPLATE,
   normalizeThaiPhone,
   normalizeThaiPostalCode,
