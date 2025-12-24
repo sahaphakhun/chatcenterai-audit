@@ -19,6 +19,8 @@ const InstructionDataService = require("./services/instructionDataService");
 const createNotificationService = require("./services/notificationService");
 const slipOkService = require("./services/slipOkService");
 const {
+  DEFAULT_AUDIT_ASK_TEMPLATE,
+  DEFAULT_AUDIT_SUMMARY_TEMPLATE,
   validateOrderDraft,
   buildAuditAskMessage,
   buildAuditSummaryMessage,
@@ -3215,6 +3217,8 @@ function getDefaultOrderAuditConfig() {
   return {
     enabled: false,
     waitForMainAiSeconds: ORDER_AUDIT_DEFAULT_WAIT_SECONDS,
+    askMissingTemplate: DEFAULT_AUDIT_ASK_TEMPLATE,
+    summaryTemplate: DEFAULT_AUDIT_SUMMARY_TEMPLATE,
   };
 }
 
@@ -3244,6 +3248,21 @@ function normalizeOrderAuditConfig(rawConfig) {
     rawConfig.waitForMainAiSeconds,
     defaults.waitForMainAiSeconds,
     { min: 0, max: 3600 },
+  );
+
+  const normalizeTemplate = (value, fallback) => {
+    if (typeof value !== "string") return fallback;
+    const trimmed = value.trim();
+    return trimmed ? trimmed : fallback;
+  };
+
+  normalized.askMissingTemplate = normalizeTemplate(
+    rawConfig.askMissingTemplate,
+    defaults.askMissingTemplate,
+  );
+  normalized.summaryTemplate = normalizeTemplate(
+    rawConfig.summaryTemplate,
+    defaults.summaryTemplate,
   );
 
   return normalized;
@@ -3919,9 +3938,16 @@ async function runOrderAuditForNewMessage(triggerMessageDoc) {
     : [];
 
   const kind = validation.isComplete ? "summary" : "ask_missing";
+  const auditTemplates = orderAudit || {};
   const messageText = validation.isComplete
-    ? buildAuditSummaryMessage(validation.normalizedDraft)
-    : buildAuditAskMessage(validation.missingFields);
+    ? buildAuditSummaryMessage(
+        validation.normalizedDraft,
+        auditTemplates.summaryTemplate,
+      )
+    : buildAuditAskMessage(
+        validation.missingFields,
+        auditTemplates.askMissingTemplate,
+      );
 
   if (!messageText) {
     const updateDoc = {

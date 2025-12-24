@@ -55,6 +55,23 @@ function buildAddressText(draft) {
   return parts.join(" ").trim();
 }
 
+const DEFAULT_AUDIT_ASK_TEMPLATE = `ขอข้อมูลจัดส่งเพิ่มเติมเพื่อสรุปออเดอร์นะคะ 🙏
+{{missing_fields}}
+
+พิมพ์รวมในข้อความเดียวได้เลยค่ะ`;
+
+const DEFAULT_AUDIT_SUMMARY_TEMPLATE = `✅ขอบคุณค่ะ สรุปรายการดังนี้
+
+{{items_lines}}
+⭐️ยอดรวม {{total_text}}{{payment_summary}}
+
+ชื่อ: {{customer_name}}
+ที่อยู่: {{address_text}}
+โทร: {{phone}}
+
+🚚จัดส่งภายใน 2-3 วันทำการค่ะ
+หากมีเลขพัสดุจะแจ้งให้ทราบอีกครั้ง ขอบคุณมากค่ะ✅`;
+
 const FIELD_LABELS = Object.freeze({
   customerName: "ชื่อผู้รับ",
   shippingAddress: "ที่อยู่",
@@ -64,6 +81,24 @@ const FIELD_LABELS = Object.freeze({
   addressPostalCode: "รหัสไปรษณีย์ (5 หลัก)",
   phone: "เบอร์โทร (10 หลัก)",
 });
+
+function normalizeTemplateString(value, fallback) {
+  if (typeof value !== "string") return fallback;
+  const trimmed = value.trim();
+  return trimmed ? trimmed : fallback;
+}
+
+function renderTemplate(template, values = {}) {
+  if (typeof template !== "string") return "";
+  const safeValues = values && typeof values === "object" ? values : {};
+  return template.replace(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g, (match, key) => {
+    if (!Object.prototype.hasOwnProperty.call(safeValues, key)) {
+      return match;
+    }
+    const value = safeValues[key];
+    return value === null || typeof value === "undefined" ? "" : String(value);
+  });
+}
 
 function validateOrderDraft(draft, requiredFields = null) {
   const required =
@@ -152,7 +187,10 @@ function formatOrderItemsLines(items) {
   return lines.join("\n");
 }
 
-function buildAuditAskMessage(missingFields = []) {
+function buildAuditAskMessage(
+  missingFields = [],
+  template = DEFAULT_AUDIT_ASK_TEMPLATE,
+) {
   if (!Array.isArray(missingFields) || missingFields.length === 0) {
     return "";
   }
@@ -163,12 +201,23 @@ function buildAuditAskMessage(missingFields = []) {
 
   if (!labels.length) return "";
 
-  return `ขอข้อมูลจัดส่งเพิ่มเติมเพื่อสรุปออเดอร์นะคะ 🙏\n${labels
-    .map((label) => `- ${label}`)
-    .join("\n")}\n\nพิมพ์รวมในข้อความเดียวได้เลยค่ะ`;
+  const missingLines = labels.map((label) => `- ${label}`).join("\n");
+  const missingText = labels.join(", ");
+  const safeTemplate = normalizeTemplateString(
+    template,
+    DEFAULT_AUDIT_ASK_TEMPLATE,
+  );
+
+  return renderTemplate(safeTemplate, {
+    missing_fields: missingLines,
+    missing_fields_text: missingText,
+  });
 }
 
-function buildAuditSummaryMessage(draft) {
+function buildAuditSummaryMessage(
+  draft,
+  template = DEFAULT_AUDIT_SUMMARY_TEMPLATE,
+) {
   if (!draft || typeof draft !== "object") return "";
 
   const itemsLines = formatOrderItemsLines(draft.items);
@@ -211,10 +260,31 @@ function buildAuditSummaryMessage(draft) {
 
   const paymentSummary = [shippingLabel, paymentLabel].filter(Boolean).join(" ");
 
-  return `✅ขอบคุณค่ะ สรุปรายการดังนี้\n\n${itemsLines}\n⭐️ยอดรวม ${totalText}${paymentSummary ? ` ${paymentSummary}` : ""}\n\nชื่อ: ${customerName || "-"}\nที่อยู่: ${addressText || "-"}\nโทร: ${phone || "-"}\n\n🚚จัดส่งภายใน 2-3 วันทำการค่ะ\nหากมีเลขพัสดุจะแจ้งให้ทราบอีกครั้ง ขอบคุณมากค่ะ✅`;
+  const safeTemplate = normalizeTemplateString(
+    template,
+    DEFAULT_AUDIT_SUMMARY_TEMPLATE,
+  );
+
+  const paymentSummaryText = paymentSummary ? ` ${paymentSummary}` : "";
+
+  return renderTemplate(safeTemplate, {
+    items_lines: itemsLines,
+    total_text: totalText,
+    total_amount: totalAmount !== null ? totalAmount : "",
+    shipping_cost: shippingCost !== null ? shippingCost : "",
+    shipping_label: shippingLabel,
+    payment_label: paymentLabel,
+    payment_method: paymentMethod,
+    payment_summary: paymentSummaryText,
+    customer_name: customerName || "-",
+    address_text: addressText || "-",
+    phone: phone || "-",
+  });
 }
 
 module.exports = {
+  DEFAULT_AUDIT_ASK_TEMPLATE,
+  DEFAULT_AUDIT_SUMMARY_TEMPLATE,
   normalizeThaiPhone,
   normalizeThaiPostalCode,
   buildAddressText,

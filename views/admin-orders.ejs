@@ -292,6 +292,24 @@
                     <small class="text-muted">ใช้เมื่อระบบ AI หลักเปิด (เช่น 60 วินาที)</small>
                   </div>
 
+                  <div class="mb-3">
+                    <label class="form-label fw-semibold">ข้อความถามข้อมูลที่ขาด</label>
+                    <textarea class="form-control" id="auditSettingsAskTemplate" rows="5"></textarea>
+                    <small class="text-muted">
+                      ตัวแปรที่ใช้ได้: <code>{{missing_fields}}</code>, <code>{{missing_fields_text}}</code>
+                    </small>
+                  </div>
+
+                  <div class="mb-3">
+                    <label class="form-label fw-semibold">ข้อความสรุปยอด/สรุปออเดอร์</label>
+                    <textarea class="form-control" id="auditSettingsSummaryTemplate" rows="8"></textarea>
+                    <small class="text-muted">
+                      ตัวแปรที่ใช้ได้: <code>{{items_lines}}</code>, <code>{{total_text}}</code>,
+                      <code>{{payment_summary}}</code>, <code>{{customer_name}}</code>, <code>{{address_text}}</code>,
+                      <code>{{phone}}</code>, <code>{{shipping_label}}</code>, <code>{{payment_label}}</code>
+                    </small>
+                  </div>
+
                   <div class="text-muted small mb-3">
                     ตรวจข้อมูลขั้นต่ำ: ชื่อผู้รับ, ที่อยู่, ตำบล/แขวง, อำเภอ/เขต, รหัสไปรษณีย์ 5 หลัก, เบอร์โทร 10 หลัก
                   </div>
@@ -429,6 +447,8 @@
         document.getElementById('auditSettingsEnabled').checked = audit.enabled === true;
         document.getElementById('auditSettingsWaitSeconds').value =
           typeof audit.waitForMainAiSeconds === 'number' ? audit.waitForMainAiSeconds : 60;
+        document.getElementById('auditSettingsAskTemplate').value = audit.askMissingTemplate || '';
+        document.getElementById('auditSettingsSummaryTemplate').value = audit.summaryTemplate || '';
       }
 
 		      async function savePageAISettings() {
@@ -452,12 +472,16 @@
 
         const auditEnabled = document.getElementById('auditSettingsEnabled').checked;
         const auditWaitSecondsRaw = parseInt(document.getElementById('auditSettingsWaitSeconds').value, 10);
+        const auditAskTemplate = document.getElementById('auditSettingsAskTemplate').value;
+        const auditSummaryTemplate = document.getElementById('auditSettingsSummaryTemplate').value;
 
         const safeInt = (value, fallback) => Number.isFinite(value) ? value : fallback;
 
         const orderAudit = {
           enabled: auditEnabled,
-          waitForMainAiSeconds: safeInt(auditWaitSecondsRaw, 60)
+          waitForMainAiSeconds: safeInt(auditWaitSecondsRaw, 60),
+          askMissingTemplate: auditAskTemplate,
+          summaryTemplate: auditSummaryTemplate
         };
 
         const btn = document.getElementById('aiSettingsSaveBtn');
